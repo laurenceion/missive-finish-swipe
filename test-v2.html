@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src https://integrations.missiveapp.com/missive.js 'sha256-ASGdUjQ1Mtc7M0AlAtKvsJ1YvaKOZ5Y+IH3bMQDtcVg=' 'sha256-P2zHsMKGk1S4jXxRcA57vQFx/r2J5SNCqPTC8G8Ysgw='; style-src 'sha256-qL0q0IvATdlWgN5EC6ms0evKis1O+aXf+YBWuHoMNNs='; connect-src 'none'; img-src 'none'; font-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
+<title>Finish Missive test conversation</title><style>body{font:16px system-ui,sans-serif;margin:24px;max-width:42rem;color:#163025;background:#f6faf7}h1{font-size:1.3rem}code{overflow-wrap:anywhere}p{line-height:1.5}#status{padding:16px;border:1px solid #b8cec0;border-radius:10px;background:white}</style></head>
+<body><h1>Finish Missive test conversation</h1>
+<p>Disposable-test integration. It sends Missive's explicit <strong>Close</strong> action once after checking the selected conversation.</p>
+<p id="status" role="status" aria-live="polite">Loading the official Missive SDK…</p>
+<p>Only the conversation configured in the URL's <code>#test=</code> fragment is accepted. Do not change the selection while testing.</p>
+<p>Dispatch does not confirm closure or cleanup. The configured organization rule performs cleanup. No separate archive is sent.</p>
+<script src="https://integrations.missiveapp.com/missive.js"></script>
+<script>(function (root, factory) {
+  "use strict";
+  if (typeof module === "object" && module.exports) module.exports = factory();
+  else root.MissiveCleanupTest = factory();
+})(typeof globalThis === "object" ? globalThis : this, function () {
+  "use strict";
+
+  const SWIPE_ID = "finish-missive-private-cleanup-test-v1";
+  const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+  function parseTestFragment(fragment) {
+    if (typeof fragment !== "string" || !fragment.startsWith("#")) return null;
+    const params = new URLSearchParams(fragment.slice(1));
+    const keys = [...params.keys()];
+    const id = params.get("test");
+    return keys.length === 1 && keys[0] === "test" && typeof id === "string" && UUID.test(id) ? id : null;
+  }
+
+  function createController(sdk, options = {}) {
+    const later = options.setTimeout || setTimeout;
+    const cancel = options.clearTimeout || clearTimeout;
+    const timeoutMs = options.timeoutMs || 5000;
+    const onStatus = options.onStatus || function () {};
+    const targetId = typeof options.allowedTestId === "string" && UUID.test(options.allowedTestId) ? options.allowedTestId : null;
+    let selection = null;
+    let selectionEvents = 0;
+    let lastSelectionShape = "none received";
+    let pending = null;
+    let dispatched = false;
+    let installed = false;
+    let status = { code: "idle", message: "Test ready. Only the disposable conversation is allowed." };
+
+    function report(code, message, showAlert) {
+      status = { code, message };
+      onStatus(status);
+      // Native host currently mishandles `note`: it wraps message in a React
+      // object before markdown rendering. Keep both fields plain strings.
+      if (showAlert) sdk.alert({
+        title: "Finish Missive test: " + code,
+        message: message + " Selection events: " + selectionEvents + "; last: " + lastSelectionShape + "."
+      });
+      return status;
+    }
+
+    function isTargetSelection() {
+      return targetId !== null && Array.isArray(selection) && selection.length === 1 && selection[0] === targetId;
+    }
+
+    function stopWaiting() {
+      if (!pending) return;
+      cancel(pending.timer);
+      pending = null;
+    }
+
+    function sendIfMatched() {
+      if (!pending || dispatched || !isTargetSelection()) return false;
+      // No await, timer, UI callback or other yield between the selection check
+      // and dispatch. The SDK still has an unavoidable cross-frame race.
+      dispatched = true;
+      stopWaiting();
+      try {
+        sdk.close();
+      } catch (_) {
+        report("delivery_unknown", "The Close call failed. Delivery is unknown. Check the disposable conversation before reloading or retrying.", true);
+        return false;
+      }
+      report("dispatched", "Close dispatched to Missive. Closure and cleanup rule completion are not confirmed. Check the disposable conversation and Gmail before reloading or retrying.", true);
+      return true;
+    }
+
+    function changed(ids) {
+      selectionEvents++;
+      selection = Array.isArray(ids) ? ids.slice() : null;
+      lastSelectionShape = !Array.isArray(ids) ? "invalid payload" : ids.length === 0 ? "empty" : ids.length > 1 ? "multiple" : ids[0] === targetId ? "single matching target" : "single different target";
+      if (!pending) return;
+      if (isTargetSelection()) {
+        sendIfMatched();
+      } else if (!Array.isArray(selection) || selection.length > 0) {
+        stopWaiting();
+        report("selection_changed", "Selection changed to another conversation or multiple conversations. No Close was sent.", true);
+      }
+      // Empty selection may be an intermediate navigation event. Wait boundedly.
+    }
+
+    function run(payload) {
+      if (!installed) return report("not_ready", "The integration is not ready.", true);
+      if (pending) return report("busy", "A cleanup test is already waiting for its conversation. No second Close was sent.", false);
+      if (dispatched) return report("already_dispatched", "This integration already dispatched one test Close. Check its result before reloading to run another test.", true);
+      if (!payload || !payload.conversation || payload.conversations != null ||
+          typeof payload.conversation.id !== "string" || payload.conversation.id !== targetId) {
+        return report("wrong_target", "This test only accepts the disposable Missive shortcut verification conversation. Nothing was changed.", true);
+      }
+
+      try {
+        // Current host selects this integration while closing its sidebar. Its
+        // selection broadcasts only reach selected integrations, even utilities.
+        // Keep this before navigate so the next selection update reaches us.
+        sdk.closeSelf();
+      } catch (_) {
+        return report("integration_unavailable", "Missive could not select this integration for updates. No Close was sent.", true);
+      }
+
+      const operation = { timer: null };
+      pending = operation;
+      operation.timer = later(function () {
+        if (pending !== operation) return;
+        stopWaiting();
+        report("timeout", "Missive did not confirm the single test conversation within five seconds. No Close was sent.", true);
+      }, timeoutMs);
+      report("navigating", "Opening the disposable conversation and waiting for its selection confirmation.", false);
+      try {
+        sdk.navigate({ conversationId: targetId });
+      } catch (_) {
+        if (!dispatched) {
+          stopWaiting();
+          return report("navigation_failed", "Missive could not open the test conversation. No Close was sent.", true);
+        }
+      }
+      // navigate() can be a no-op when this exact conversation is already open.
+      // In that case use the latest matching documented selection event.
+      sendIfMatched();
+      return status;
+    }
+
+    function install() {
+      if (installed) return;
+      for (const method of ["on", "setActions", "setAsUtility", "closeSelf", "navigate", "close", "alert"]) {
+        if (!sdk || typeof sdk[method] !== "function") throw new Error("Missing Missive SDK method: " + method);
+      }
+      if (targetId === null) {
+        report("missing_test_id", "No valid test conversation is configured. Add exactly #test=<conversation-UUID> to the integration URL. No action was registered.", false);
+        return;
+      }
+      installed = true;
+      // This option is supported by the official SDK and host implementation,
+      // but omitted from the current reference page. Utilities need it hidden.
+      sdk.on("change:conversations", changed, { retroactive: true, triggerWhenHidden: true });
+      sdk.setAsUtility();
+      sdk.setActions([{
+        label: "Finish test conversation",
+        contexts: ["swipe", "conversation"],
+        swipe_id: SWIPE_ID,
+        swipe_color: "#276749",
+        emoji: ":broom:",
+        callback: run
+      }]);
+      report("ready", "Test ready. Only the disposable conversation is allowed.", false);
+    }
+
+    return Object.freeze({ install, run, getStatus: () => ({ ...status }) });
+  }
+
+  return Object.freeze({ SWIPE_ID, parseTestFragment, createController });
+});
+</script>
+<script>(function () {
+  "use strict";
+  const status = document.getElementById("status");
+  try {
+    const controller = MissiveCleanupTest.createController(window.Missive, {
+      allowedTestId: MissiveCleanupTest.parseTestFragment(window.location.hash),
+      onStatus: function (result) {
+        status.textContent = result.code + ": " + result.message;
+        status.dataset.state = result.code;
+      }
+    });
+    controller.install();
+  } catch (_) {
+    status.textContent = "The Missive SDK could not initialize. No action is available and nothing was changed.";
+    status.dataset.state = "initialization_failed";
+  }
+})();
+</script>
+</body></html>
